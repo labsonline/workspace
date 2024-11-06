@@ -1,0 +1,8 @@
+[Unit]
+Description=Ceph Loop Device %I
+
+[Service]
+ExecStart=losetup /dev/loop10%i /srv/rook-ceph-%i.img
+
+[Install]
+WantedBy=multi-user.target

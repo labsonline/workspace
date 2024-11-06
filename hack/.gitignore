@@ -1,0 +1,15 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+!cluster
+!cluster/*.yaml
+!manifest
+!manifest/*.yaml
+!pod.yaml
+!*.example
+!boilerplate.txt
+
+# ...even if they are in subdirectories
+!*/

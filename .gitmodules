@@ -1,0 +1,18 @@
+[submodule "modules/dotfiles"]
+	path = modules/dotfiles
+	url = https://github.com/anselmes/dotfiles.git
+[submodule "modules/tooling"]
+	path = modules/tooling
+	url = https://github.com/anselmes/tooling.git
+[submodule "modules/images"]
+	path = modules/images
+	url = https://github.com/anselmes/images.git
+[submodule "modules/charts"]
+	path = modules/charts
+	url = https://github.com/anselmes/charts.git
+[submodule "modules/osh/openstack-helm"]
+	path = modules/osh/openstack-helm
+	url = https://review.opendev.org/openstack/openstack-helm.git
+[submodule "modules/osh/openstack-helm-infra"]
+	path = modules/osh/openstack-helm-infra
+	url = https://review.opendev.org/openstack/openstack-helm-infra.git

@@ -1,0 +1,407 @@
+heat_template_version: 2017-02-24
+
+description: >
+
+  Template is creating an instance with cinder volume and two NICs.
+
+parameters:
+  public_key_name:
+    type: string
+    description: ssh public key name
+
+  public_key:
+    type: string
+    description: ssh public key
+
+  image:
+    type: string
+    description: Name of image to use for servers
+    constraints: [custom_constraint: glance.image]
+  external_net:
+    type: string
+    description: ID or name of external network
+    constraints: [custom_constraint: neutron.network]
+  internal_net:
+    type: string
+    description: ID or name of internal network
+    constraints: [custom_constraint: neutron.network]
+  dns_nameservers:
+    type: comma_delimited_list
+    description: DNS nameservers for the subnet
+
+  # e2e scenario parameters
+  # affinity policies
+  affinity_policies:
+    type: comma_delimited_list
+    description: Allowed values anti-affinity, affinity, soft-anti-affinity, soft-affinity
+    constraints:
+      - allowed_values:
+          ["anti-affinity", "affinity", "soft-anti-affinity", "soft-affinity"]
+
+  # security group
+  secgroup_tcp_ports:
+    type: comma_delimited_list
+    description: TCP ports to be opened by security group
+
+  # cinder volume
+  cinder_volume_size:
+    type: string
+    description: Cinder volume size
+    default: 20
+
+  ram_size:
+    type: string
+    description: RAM size
+    default: 4096
+
+  instance_vcpus:
+    type: number
+    description: VCPUs for WordPress server
+    default: 2
+
+  #availability zone
+  azone:
+    type: string
+    description: Availability zone name
+
+resources:
+  key_pair:
+    type: OS::Nova::KeyPair
+    properties:
+      name: { get_param: public_key_name }
+      public_key: { get_param: public_key }
+
+  nova_flavor:
+    type: OS::Nova::Flavor
+    properties:
+      disk: { get_param: cinder_volume_size }
+      ephemeral: 0
+      extra_specs: { "hw:cpu_policy": "dedicated", "hw:mem_page_size": "large" }
+      is_public: true
+      ram: { get_param: ram_size }
+      vcpus: { get_param: instance_vcpus }
+
+  cinder_volume1:
+    type: OS::Cinder::Volume
+    properties:
+      size: { get_param: cinder_volume_size }
+      image: { get_param: image }
+
+  tcp_secgroup:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Neutron Secutity Group Rules
+      rules:
+        repeat:
+          for_each:
+            <%port%>: { get_param: secgroup_tcp_ports }
+          template:
+            protocol: tcp
+            port_range_min: <%port%>
+            port_range_max: <%port%>
+
+  # creating two(2) vms, each vm has three(3) ports and they are linked with SRIOVs and external network.
+  vm1:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      key_name: { get_resource: key_pair }
+      flavor: { get_resource: nova_flavor }
+      networks:
+        - port: { get_resource: ext_port }
+        - port: { get_resource: int_port }
+      availability_zone: { get_param: azone }
+      block_device_mapping:
+        - volume_id: { get_resource: cinder_volume1 }
+          device_name: vda
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: sre_config1 }
+  sre_init1:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: |
+        #!/bin/sh
+        hostname
+        ip addr show
+        netstat -rn
+        HOSTNAME=$(hostname)
+        IP=$(ifconfig ens3 | grep 'inet ' | awk '{print $2}')
+        echo "${IP} ${HOSTNAME}" >> /etc/hosts
+        whoami
+  sre_init2:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        users:
+          - default
+          - name: { get_param: username }
+            groups:
+              - adm
+              - dialout
+              - dip
+              - lxd
+              - netdev
+              - plugdev
+              - sudo
+            lock_passwd: true
+            shell: /bin/zsh
+            sudo: ALL=(ALL) NOPASSWD:ALL
+            ssh_import_id: None
+            ssh_redirect_user: true
+            ssh_authorized_keys:
+              - { get_param: public_key }
+        growpart:
+          mode: auto
+          ignore_growroot_disabled: false
+          devices:
+            - /
+        apt:
+          sources:
+          docker:
+            source: deb https://download.docker.com/linux/ubuntu "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable
+            key: |
+              -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+              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
+              YT90qFF93M3v01BbxP+EIY2/9tiIPbrd
+              =0YYh
+              -----END PGP PUBLIC KEY BLOCK-----
+          kubernetes:
+            source: deb https://apt.kubernetes.io/ kubernetes-xenial main
+            key: |
+              -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+              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
+              =UL8X
+              -----END PGP PUBLIC KEY BLOCK-----
+          helm:
+            source: deb https://baltocdn.com/helm/stable/debian/ all main
+            key: |
+              -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+              mQINBF6yP7IBEADWk4aijQ7Vhj7wn2oz+8asnfzsD0+257qjWy1m+cN4RP6T2NBG
+              S2M5+vzbsKNmGAja8jOpo46pHo/SCdc8Bwv+QHH+JbuBbDNEHwIBGV5p+ZRETiHq
+              l8UsyUAPCWinKR6evZrANCBEzXtOEVJ4thuPoBuZkteKNTdPlOg9MBqD5zz+4iQX
+              2CJJNW7+1sxAAVozHJxjJbu6c84yPvNFAiCAct+x5WJZFJWuO+l55vl6va8cV7tw
+              DgHomk+1Q7w00Z0gh28Pe1yfvvw3N+pCSYn88mSgZtdP3wz3pABkMe4wMobNWuyX
+              bIjGMuFDs7vGBY6UCL6alI/VC7rrSZqJZjntuoNI0Xlfc3BjUHWzinlbA7UFk5Lv
+              qZO61V439Wm4x2n1V+4Kj/nPwtgBrNghaeDjxWLlgqaqynltSpXYnv2qGWYLRUb9
+              WFymbYCJ0piqRdNVNNI8Ht9nFaya6qjDcIxFwFMF9QcrECG1HCK1M5JjdJpzr6Jq
+              Z27/2ZG7DhabArSR5aoyBqhCylJfXugneDhitmilJiQd5EzefjiDO29EuBSMwkAs
+              +IKg9jxGyI47m3+ITWhMDWTFTYBF/O69iKXfFvf4zrbfGMcf2w8vIOEBU3eTSYoY
+              RhHXROedwcYpaVGJmsaT38QTSMqWTn12zlvmW5f6mEI5LQq398gN9eiWDwARAQAB
+              tERIZWxtIGhvc3RlZCBieSBCYWx0byAoUmVwb3NpdG9yeSBzaWduaW5nKSA8Z3Bn
+              c2VjdXJpdHlAZ2V0YmFsdG8uY29tPokCVAQTAQoAPhYhBIG/gy4vGc0qoEcZWSlK
+              xIJ8GhaKBQJesj+yAhsvBQkSzAMABQsJCAcCBhUKCQgLAgQWAgMBAh4BAheAAAoJ
+              EClKxIJ8GhaKPHEP/RRzvYCetoLeIj5FtedbeumGcWaJj97L4R1j7iK0dc0uvg0T
+              5JeMDttAt69dFPHyB0kR1BLSwgJBhYCtvwalvD/g7DmL5l5HIM7o/VrkXDay1Pee
+              wkCclA18y2wNM5EXKAuoFX5FMkRpTtSQhMMllbKsNNSvwvEZWvqMQlwJ/2HgNoVl
+              2NtfY65UXHvIV2nTTmCVDq4OYBlHoUX5rRE7fOgFZ+u6Su7yopTYy13yY8ZVDNf/
+              qNUWqA41gRYnwYtSq1DogHq1dcyr/SW/pFsn4n4LjG+38CIkSjFKOeusg2KPybZx
+              l/z0/l0Yv4pTaa91rh1hGWqhvYDbLr2XqvI1wpcsIRPpU8lasycyQ8EeI4B5FVel
+              ea2Z6rvGtMG92wVNCZ6YMYzpvRA9iRgve4J4ztlCwr0Tm78vY/vZfU5jkPW1VOXJ
+              6nW/RJuc2mecuj8YpJtioNVPbfxE/CjCCnGEnqn511ZYqKGd+BctqoFlWeSihHst
+              tuSqJoqjOmt75MuN6zUJ0s3Ao+tzCmYkQzn2LUwnYisioyTW4gMtlh/wsU6Rmims
+              s5doyG2Mcc0QfstXLMthVkrBpbW4XT+Q6aTGUMlMv1BhKycDUmewI2AMNth5Hood
+              iEt18+X26+Q2exojaMHOCdkUJ+C44XPDy6EvG4RyO4bILHz5obD/9QZO/lzK
+              =BFdd
+              -----END PGP PUBLIC KEY BLOCK-----
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - containerd.io
+          - curl
+          - docker-buildx-plugin
+          - docker-ce
+          - docker-ce-cli
+          - docker-compose-plugin
+          - fonts-font-awesome
+          - git
+          - gnupg
+          - helm
+          - jq
+          - kubectl
+          - python3
+          - python3-setuptools
+          - python3-virtualenv
+          - zsh
+        write_files:
+          - path: /etc/environment
+            permission: 0644
+            owner: root
+            content: |
+              PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+          - path: "/home/{ get_param: username }/.zshrc"
+            permissions: 0644
+            owner: { get_param: username }
+            content: |
+              export ZSH="${HOME}/.oh-my-zsh"
+
+              ZSH_THEME="ys"
+              DISABLE_UPDATE_PROMPT="true"
+
+              plugins=(
+                alias-finder
+                colorize
+                common-aliases
+                docker
+                dotenv
+                encode64
+                git
+                git-extras
+                gitignore
+                git-lfs
+                helm
+                jsontools
+                kubectl
+                sudo
+                vscode
+                z
+              )
+
+              source "${ZSH}/oh-my-zsh.sh"
+              source /etc/profile
+
+              export GPG_TTY="$(tty)"
+              export KREW_ROOT="${HOME}/.krew"
+              export LANG=en_US.UTF-8
+              if [[ -n "${SSH_CONNECTION}" ]]; then
+                export EDITOR="vim"
+              else
+                export EDITOR="mvim"
+              fi
+
+              alias zshconfig="code ~/.zshrc"
+              alias ohmyzsh="code ~/.oh-my-zsh"
+              alias k="kubectl"
+              alias h="helm"
+
+              zstyle :omz:plugins:ssh-agent agent-forwarding on
+              zstyle :omz:plugins:ssh-agent ssh-add-args -A
+        runcmd:
+          - python -m pip install --upgrade setuptools
+          - python -m venv /home/{ get_param: username }
+        bootcmd:
+          - echo "Boot Completed!!!"
+  sre_config1:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+        - config: { get_resource: sre_init1 }
+        - config: { get_resource: sre_init2 }
+
+  ext_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: external_net }
+      security_groups:
+        - { get_resource: tcp_secgroup }
+
+  int_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: internal_net }
+
+outputs:
+  srevm1_instance_name:
+    value: { get_attr: [vm1, instance_name] }
+  srevm1_ip:
+    value: { get_attr: [vm1, first_address] }

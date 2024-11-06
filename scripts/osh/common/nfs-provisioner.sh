@@ -1,0 +1,1 @@
+../../../modules/osh/openstack-helm-infra/tools/deployment/common/nfs-provisioner.sh
