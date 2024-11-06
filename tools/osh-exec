@@ -1,0 +1,327 @@
+#!/bin/bash
+# osh-exec  Copyright (C) 2023 AT&T
+
+# This program comes with ABSOLUTELY NO WARRANTY.
+# This is free software, and you are welcome to redistribute it
+# under certain conditions.
+
+# Contributors:
+#     Schubert Anselme <sa246v@att.com>
+#     Sergiy Markin <sm515x@att.com>
+#     Leontii Istomin <li3668@att.com>
+set -e
+
+# trap errors
+trap trap_error ERR
+
+#######################################################################
+# REQUIREMENT CHECKS
+#######################################################################
+[[ -z ${KUBECONFIG} ]] && echo "FATAL: KUBECONFIG is not set" && exit 1
+SITE_NAME="$(kubectl --kubeconfig ${KUBECONFIG} config current-context | cut -d@ -f2)"
+export SITE_NAME
+
+#######################################################################
+# EVIRONMENT VARIABLES
+#######################################################################
+[[ -f "${OSH_EXEC_PATH}/.env" ]] && source "${OSH_EXEC_PATH}/.env"
+
+export OSH_VERSION="0.1.0"
+
+export OS_UTIL_NS="utility"
+export OS_UTIL_DEP="clcp-openstack-utility"
+
+export CEPH_UTIL_NS="tenant-ceph"
+export CEPH_UTIL_DEP="ceph-mon-check"
+
+#######################################################################
+# SCRIPT FUNCTIONS
+#######################################################################
+trap_exit() {
+  echo "INFO: exiting"
+  exit $?
+}
+
+trap_error() {
+  echo "FATAL: failed with exit code $?"
+  exit 1
+}
+
+upload_heat_stack() {
+  ENFILE="${1}"
+  STACKFILE="${2}"
+
+  # validate args
+  [[ -z ${ENFILE} ]] && echo "ERROR: missing heat stack environment file" && exit 2
+  [[ -z ${STACKFILE} ]] && echo "ERROR: missing heat stack template file" && exit 2
+
+  # upload heat stack template
+  echo "INFO: uploading stack envfile and template..."
+  kubectl --kubeconfig ${KUBECONFIG} -n "${OS_UTIL_NS}" cp "${ENFILE}" "${OS_UTIL_POD}:/tmp/"
+  kubectl --kubeconfig ${KUBECONFIG} -n "${OS_UTIL_NS}" cp "${STACKFILE}" "${OS_UTIL_POD}:/tmp/"
+  echo "SUCCESS: stack envfile and template uploaded!!!"
+
+  # optionally validate heat stack template
+  [[ ${3} == "--validate" ]] && validate_heat_stack
+}
+
+validate_heat_stack() {
+  echo "INFO: validating stack template..."
+  ${OS_EXEC} orchestration template validate --template /tmp/stack.aqua.yaml --environment /tmp/stack.aqua.env
+  echo "SUCCESS: stack template validated!!!"
+}
+
+deploy_heat_stack() {
+  STACK_NAME="${STACK_NAME:-$1}"
+
+  # validate args
+  [[ -z ${STACK_NAME} ]] && echo "ERROR: missing stack name" && exit 2
+
+  # deploy heat stack
+  echo "INFO: creating stack ${STACK_NAME}..."
+  ${OS_EXEC} stack create --template /tmp/stack.att.yaml --environment /tmp/stack.att.env "${1}"
+  echo "SUCCESS: stack created!!!"
+}
+
+upload_qcow_image() {
+  IMAGE_FILE="${IMAGE_FILE:-$1}"
+  IMAGE_NAME="${IMAGE_NAME:-$2}"
+
+  # validate args
+  [[ -z ${IMAGE_FILE} ]] && echo "ERROR: missing image file" && exit 2
+  [[ -z ${IMAGE_NAME} ]] && echo "ERROR: missing image name" && exit 2
+
+  # TODO: should we check if already uploaded?
+
+  # upload image to utility container
+  echo "INFO: uploading ${IMAGE_FILE} to utility container..."
+  kubectl --kubeconfig ${KUBECONFIG} -n "${OS_UTIL_NS}" cp "${IMAGE_FILE}" "${OS_UTIL_POD}:tmp/${IMAGE_NAME}"
+  echo "SUCCESS: image uploaded!!!"
+
+  # create image in openstack
+  echo "INFO: creating ${IMAGE_NAME} in openstack..."
+  ${OS_EXEC} image create --disk-format qcow2 --container-format bare --public --file "tmp/${IMAGE_FILE}" "${IMAGE_NAME}" #--project-domain qa
+  echo "SUCCESS: image loaded!!!"
+}
+
+create_vm() {
+  STACK_NAME=${STACK_NAME:-$1}
+  # OSH_CONFIG_PATH=${OSH_CONFIG_PATH:-$2}
+  OSH_CONFIG_PATH=/h/wip
+
+  # validate args
+  [[ -z ${STACK_NAME} ]] && echo "ERROR: missing stack name" && exit 2
+  # [[ ! -f ${OSH_CONFIG_PATH}/stack.aqua.env ]] && echo "ERROR: missing stack env" && exit 2
+  # [[ ! -f ${OSH_CONFIG_PATH}/stack.aqua.yaml ]] && echo "ERROR: missing stack template" && exit 2
+
+  # TODO: check if stack exists
+
+  # upload heat stack template and validate
+  echo "INFO: uploading stack template and validating..."
+  upload_heat_stack ${OSH_CONFIG_PATH}/stack.aqua.env ${OSH_CONFIG_PATH}/stack.aqua.yaml --validate
+  echo "SUCCESS: stack template uploaded and validated!!!"
+
+  # deploy heat stack
+  echo "INFO: deploying stack ${STACK_NAME}"
+  deploy_heat_stack "${STACK_NAME}"
+  echo "SUCCESS: stack deployed!!!"
+}
+
+print_version() {
+  echo "osh-exec version ${OSH_VERSION}"
+}
+
+print_usage() {
+  echo """
+Usage: osh-exec [OPTIONS] COMMAND [ARGUMENTS]
+
+Options:
+  -h, --help      print this help message
+  -d, --debug     enable debug mode
+  -v, --version   print version information
+
+Commands:
+  os              run openstack command
+  ceph            run ceph command
+  rbd             run ceph rbd command
+  rgw             run ceph radosgw command
+  img             download/upload image
+  vm              create/delete virtual machine
+  version         print version information
+
+Arguments:
+  SUBCOMMAND      subcommand to execute
+  ARGUMENTS       arguments to pass to the subcommand
+
+Examples:
+  osh-exec run image list
+  osh-exec run server list
+
+Environment Variables:
+  KUBECONFIG        path to the kubeconfig file
+  OSH_CONFIG_PATH   path to the config directory
+  DEBUG             enable debug output
+  IMAGE_FILE        path to qcow2 image file
+  IMAGE_NAME        name of qcow2 image
+  STACK_NAME        name of heat stack
+  """
+}
+
+#######################################################################
+# ARGUMENTS PARSING
+#######################################################################
+
+# parse arguments
+while [[ $# -gt 0 ]]; do
+  case "${1}" in
+  -h | --help)
+    print_usage
+    exit 0
+    ;;
+  -d | --debug)
+    set -x
+    export DEBUG=1
+    shift
+    ;;
+  -v | --version | version)
+    print_version
+    exit 0
+    ;;
+  *)
+    CMD="${1}"
+    SUB_CMD="${2}"
+    SUB_CMD_ARGS=("${@:3}")
+    break
+    ;;
+  esac
+done
+
+# debug output
+[[ -n ${DEBUG} ]] &&
+  echo """
+VERSION:        ${OSH_VERSION}
+PATH:           ${OSH_EXEC}
+COMMAND:        ${CMD}
+SUBCOMMAND:     ${SUB_CMD}
+ARGUMENTS:      ${SUB_CMD_ARGS[*]}
+CONFIG:         ${OSH_CONFIG_PATH}
+SCRIPTS:        ${OSH_TOOLS_SCRIPTS}
+TOOLS:          ${OSH_TOOLS_PATH}
+  """
+
+# print usage if no command is specified
+[[ -z ${1} ]] && print_usage && exit 0
+[[ -n ${DEBUG} ]] &&
+  echo "INFO: executing ${CMD} ${SUB_CMD} ${SUB_CMD_ARGS[*]}..."
+
+#######################################################################
+# COMMAND WRAPPERS
+#######################################################################
+
+# openstack commands
+[[ -n ${DEBUG} ]] && echo "constructing openstack command..."
+construnct_os_command() {
+  OS_UTIL_POD="$(kubectl --kubeconfig ${KUBECONFIG} -n "${OS_UTIL_NS}" get pods | grep "${OS_UTIL_DEP}" | awk '{print $1}')"
+  export OS_UTIL_POD
+  [[ -z "${OS_UTIL_POD}" ]] &&
+    echo "FATAL: openstack utility pod is not running" &&
+    exit 1
+
+  OS_PASSWORD=$(kubectl --kubeconfig ${KUBECONFIG} -n openstack get secret keystone-keystone-admin -o jsonpath='{.data.OS_PASSWORD}' | base64 -d)
+  OPENSTACK_ENV_VARS="""
+OS_USERNAME=admin
+OS_PASSWORD=${OS_PASSWORD}
+OS_PROJECT_NAME=admin
+"""
+  export OS_EXEC="kubectl --kubeconfig ${KUBECONFIG} -n ${OS_UTIL_NS} exec deploy/${OS_UTIL_DEP} -- env ${OPENSTACK_ENV_VARS} openstack"
+}
+
+# FIXME: ceph commands
+[[ -n ${DEBUG} ]] && echo "constructing ceph command..."
+construnct_ceph_command() {
+  CEPH_UTIL_POD="$(kubectl --kubeconfig ${KUBECONFIG} -n "${CEPH_UTIL_NS}" get pods | grep "${CEPH_UTIL_DEP}" | awk '{print $1}')"
+  export CEPH_UTIL_POD
+  [[ -z "${CEPH_UTIL_POD}" ]] &&
+    echo "FATAL: ceph utility pod is not running" &&
+    exit 1
+
+  export CEPH_EXEC="kubectl --kubeconfig ${KUBECONFIG} -n ${CEPH_UTIL_NS} exec deploy/${CEPH_UTIL_DEP} -c ceph-mon -- ceph"
+  export RBD_EXEC="kubectl --kubeconfig ${KUBECONFIG} -n ${CEPH_UTIL_NS} exec deploy/${CEPH_UTIL_DEP} -c ceph-mon -- rbd"
+  export RGW_EXEC="kubectl --kubeconfig ${KUBECONFIG} -n ${CEPH_UTIL_NS} exec deploy/${CEPH_UTIL_DEP} -c ceph-mon -- radosgw-admin"
+}
+
+#######################################################################
+# SCRIPT RUNTIME
+#######################################################################
+
+case "${CMD}" in
+os)
+  echo "INFO: executing openstack command"
+  construnct_os_command
+  ${OS_EXEC} "${SUB_CMD}" "${SUB_CMD_ARGS[@]}"
+  ;;
+ceph)
+   echo "INFO: executing ceph command"
+   construnct_ceph_command
+   ${CEPH_EXEC} "${SUB_CMD}" "${SUB_CMD_ARGS[@]}"
+   ;;
+rbd)
+   echo "INFO: executing ceph rbd command"
+   construnct_ceph_command
+   ${RBD_EXEC} "${SUB_CMD}" "${SUB_CMD_ARGS[@]}"
+   ;;
+rgw)
+   echo "INFO: executing ceph radowgw command"
+   construnct_ceph_command
+   ${RGW_EXEC} "${SUB_CMD}" "${SUB_CMD_ARGS[@]}"
+   ;;
+img)
+  # upload image
+  if [[ "${SUB_CMD}" == "upload" ]]; then
+    IMAGE_FILE="${IMAGE_FILE:-$3}"
+    IMAGE_NAME="${IMAGE_NAME:-$4}"
+    [[ -z "${IMAGE_NAME}" ]] && IMAGE_NAME="$(basename "${IMAGE_FILE}")"
+    construnct_os_command
+    upload_qcow_image "${IMAGE_FILE}" "${IMAGE_NAME}"
+  # download image
+  elif [[ "${SUB_CMD}" == "download" ]]; then
+    IMAGE_NAME="${IMAGE_NAME:-$3}"
+    IMAGE_FILE="${IMAGE_FILE:-$4}"
+    [[ -z "${IMAGE_NAME}" ]] && echo "ERROR: missing image name" && exit 1
+    [[ -z ${IMAGE_FILE} ]] && echo "ERROR: missing destination file" && exit 1
+    echo "INFO: saving ${IMAGE_NAME} to ${IMAGE_FILE}"
+    ${OSH_EXEC} image save "${IMAGE_NAME}" > ubuntu-22.04-jammy.qcow2
+  else
+    echo "ERROR: invalid option (upload|download)"
+    exit 1
+  fi
+  ;;
+vm)
+  STACK_NAME="${STACK_NAME:-$3}"
+  [[ -z "${STACK_NAME}" ]] && STACK_NAME="$(whoami)-dev-stack"
+  # create vm
+  if [[ ${SUB_CMD} == "create" ]]; then
+    echo "INFO: creating vm"
+    construnct_os_command
+    create_vm ${STACK_NAME}
+    [[ -n ${DEBUG} ]] &&
+      ${OSH_EXEC} stack show ${STACK_NAME} &&
+      ${OSH_EXEC} stack output list ${STACK_NAME}
+  # delete vm
+  elif [[ ${SUB_CMD} == "delete" ]]; then
+    # TODO: delete vm
+    ${OSH_EXEC} stack delete ${STACK_NAME}
+  else
+    echo "ERROR: invalid option (create|delete)"
+    exit 1
+  fi
+  ;;
+*)
+  echo "ERROR: unknown command!!!"
+  print_usage
+  exit 1
+  ;;
+esac
+
+# final output
+[[ -n ${DEBUG} ]] && echo "SUCCESS: $@ completed successfully!!!"

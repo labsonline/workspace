@@ -1,0 +1,1 @@
+../../../modules/osh/openstack-helm/tools/deployment/common/run-helm-tests.sh
